@@ -1,0 +1,6 @@
+{
+  "name": "Resume Matcher",
+  "description": "Assess resume fit against a job description and perform web searches for company context.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

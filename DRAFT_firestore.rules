@@ -1,0 +1,50 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() { 
+      return request.auth != null; 
+    }
+    
+    function isValidId(id) { 
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+    
+    function incoming() { 
+      return request.resource.data; 
+    }
+    
+    function existing() { 
+      return resource.data; 
+    }
+
+    function isValidFitAnalysisResult(data, uid) {
+      return data.keys().hasAll(['id', 'userId', 'timestamp']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.userId is string && data.userId == uid &&
+        data.timestamp is string && data.timestamp.size() <= 64;
+    }
+
+    match /users/{userId}/history/{historyId} {
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isSignedIn() && 
+                    request.auth.uid == userId && 
+                    isValidId(userId) && 
+                    isValidId(historyId) && 
+                    isValidFitAnalysisResult(incoming(), userId);
+      allow update: if isSignedIn() && 
+                    request.auth.uid == userId && 
+                    isValidId(userId) && 
+                    isValidId(historyId) && 
+                    isValidFitAnalysisResult(incoming(), userId) &&
+                    incoming().id == existing().id &&
+                    incoming().userId == existing().userId;
+      allow delete: if isSignedIn() && request.auth.uid == userId;
+      allow list: if isSignedIn() && request.auth.uid == userId && userId == request.auth.uid;
+    }
+  }
+}

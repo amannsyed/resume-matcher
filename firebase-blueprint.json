@@ -1,0 +1,41 @@
+{
+  "entities": {
+    "FitAnalysisResult": {
+      "title": "Fit Analysis Result",
+      "description": "Represents an analysis of a user's resume against a job description.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "companyName": { "type": "string" },
+        "jobTitle": { "type": "string" },
+        "fitScore": { "type": "number" },
+        "fitDecision": { "type": "string" },
+        "parameters": { "type": "array" },
+        "companyContext": { "type": "string" },
+        "strengths": { "type": "array" },
+        "weaknesses": { "type": "array" },
+        "coverLetter": { "type": "string" },
+        "learningPath": { "type": "string" },
+        "interviewPrep": { "type": "string" },
+        "ukSponsorshipStatus": { "type": "string" },
+        "applicationStatus": { "type": "string" },
+        "notes": { "type": "string" },
+        "topSkills": { "type": "array" },
+        "jobDescription": { "type": "string" },
+        "resumeText": { "type": "string" },
+        "atsParseability": { "type": "object" },
+        "resumeTailoring": { "type": "array" },
+        "jdUrl": { "type": "string" }
+      },
+      "required": ["id", "userId", "timestamp", "companyName"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/history": {
+      "schema": { "$ref": "FitAnalysisResult" },
+      "description": "Stores user job application analysis history"
+    }
+  }
+}
