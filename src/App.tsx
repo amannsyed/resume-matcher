@@ -1,6 +1,9 @@
 import React, { useState, useRef, useEffect } from "react";
 import localforage from "localforage";
-import { GoogleGenAI, Type } from "@google/genai";
+
+// Backend API URL — change this to your deployed job-intelligence URL for production
+const API_BASE_URL = "http://localhost:8000";
+
 import { useAuth } from "./AuthContext";
 import { db, OperationType, handleFirestoreError } from "./firebase";
 import { collection, doc, setDoc, updateDoc, deleteDoc, onSnapshot, query, orderBy } from "firebase/firestore";
@@ -15,7 +18,7 @@ import {
   Textarea,
   cn,
 } from "./components/ui";
-import { ArrowLeft, Upload, FileText, CheckCircle, AlertCircle, XCircle, Search, RefreshCw, Briefcase, Building, History, BarChart3, Menu, X, Link as LinkIcon, Download, BookOpen, PenTool, Plus, Trash2, Wand2, Settings } from "lucide-react";
+import { ArrowLeft, Upload, FileText, CheckCircle, AlertCircle, XCircle, Search, RefreshCw, Briefcase, Building, History, BarChart3, Menu, X, Link as LinkIcon, Download, BookOpen, PenTool, Plus, Trash2, Wand2, Settings, Copy, Check } from "lucide-react";
 import Markdown from "react-markdown";
 
 type ParameterFit = {
@@ -60,6 +63,7 @@ type FitAnalysisResult = {
   atsParseability?: { isParseable: boolean; issues: string[]; suggestions: string[] };
   resumeTailoring?: { originalPoint: string; suggestedPoint: string; reason: string }[];
   jdUrl?: string;
+  resumeProfileName?: string;
 };
 
 type ResumeProfile = {
@@ -108,12 +112,22 @@ export default function App() {
   const [result, setResult] = useState<FitAnalysisResult | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [checkUKSponsorship, setCheckUKSponsorship] = useState(false);
+  const [isManualSponsorship, setIsManualSponsorship] = useState(false);
+  const [autoSelectBestResume, setAutoSelectBestResume] = useState(false);
+  const [currentApplicationStatus, setCurrentApplicationStatus] = useState<ApplicationStatus>("Saved");
 
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [customApiKey, setCustomApiKey] = useState("");
-  const [selectedModel, setSelectedModel] = useState("gemini-3.1-pro-preview");
-  const [tempApiKey, setTempApiKey] = useState("");
-  const [tempModel, setTempModel] = useState("gemini-3.1-pro-preview");
+  const [selectedModel, setSelectedModel] = useState(0);
+  const [tempModel, setTempModel] = useState(0);
+
+  const MODEL_OPTIONS = [
+    { name: "DeepSeek V4 Pro", tag: "Recommended" },
+    { name: "DeepSeek V4 Flash", tag: "Fast" },
+    { name: "GLM 5.1", tag: "" },
+    { name: "GLM 5", tag: "" },
+    { name: "Qwen3.6-35B-A3B", tag: "" },
+    { name: "Kimi K2.6", tag: "" },
+  ];
 
   const [editingJobTitleId, setEditingJobTitleId] = useState<string | null>(null);
   const [editingJobTitleValue, setEditingJobTitleValue] = useState("");
@@ -125,6 +139,65 @@ export default function App() {
   const [emailThread, setEmailThread] = useState("");
   const [generatedEmail, setGeneratedEmail] = useState("");
   const [isGeneratingEmail, setIsGeneratingEmail] = useState(false);
+
+  // History Filters
+  const [historySearch, setHistorySearch] = useState("");
+  const [historyMinScore, setHistoryMinScore] = useState(0);
+  const [historySponsorship, setHistorySponsorship] = useState<"All" | "Yes" | "No" | "Unknown">("All");
+  const [historyStatus, setHistoryStatus] = useState<"All" | ApplicationStatus>("All");
+  const [historyDecision, setHistoryDecision] = useState<"All" | "Apply" | "Maybe Apply" | "Not Apply">("All");
+  const [historyPage, setHistoryPage] = useState(1);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [isAddManualOpen, setIsAddManualOpen] = useState(false);
+  const [manualEntry, setManualEntry] = useState({
+    companyName: "",
+    jobTitle: "",
+    fitScore: 70,
+    fitDecision: "Maybe Apply" as "Apply" | "Maybe Apply" | "Not Apply",
+    ukSponsorshipStatus: "Unknown" as "Yes" | "No" | "Unknown" | "Not Checked",
+    applicationStatus: "Saved" as ApplicationStatus,
+    jdUrl: ""
+  });
+
+  const isCancelledRef = useRef(false);
+
+  const handleCancelAnalyze = () => {
+    isCancelledRef.current = true;
+    setIsLoading(false);
+    setError("Analysis cancelled.");
+  };
+
+  const handleCopy = (text: string, id: string = "jd") => {
+    navigator.clipboard.writeText(text);
+    setCopiedId(id);
+    setTimeout(() => setCopiedId(null), 2000);
+  };
+
+  const filteredHistory = history.filter(h => {
+    const matchesSearch = 
+      h.companyName.toLowerCase().includes(historySearch.toLowerCase()) || 
+      h.jobTitle.toLowerCase().includes(historySearch.toLowerCase());
+    const matchesScore = h.fitScore >= historyMinScore;
+    const matchesSponsorship = 
+      historySponsorship === "All" || h.ukSponsorshipStatus === historySponsorship;
+    const matchesStatus = 
+      historyStatus === "All" || h.applicationStatus === historyStatus;
+    const matchesDecision = 
+      historyDecision === "All" || h.fitDecision === historyDecision;
+    
+    return matchesSearch && matchesScore && matchesSponsorship && matchesStatus && matchesDecision;
+  });
+
+  const ITEMS_PER_PAGE = 10;
+  const totalPages = Math.max(1, Math.ceil(filteredHistory.length / ITEMS_PER_PAGE));
+  const paginatedHistory = filteredHistory.slice((historyPage - 1) * ITEMS_PER_PAGE, historyPage * ITEMS_PER_PAGE);
+
+  useEffect(() => {
+    if (historyPage > totalPages && totalPages > 0) {
+      setHistoryPage(totalPages);
+    }
+  }, [totalPages, historyPage]);
+
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -163,15 +236,10 @@ export default function App() {
           setHistory(cachedHistory as FitAnalysisResult[]);
         }
         
-        const cachedKey = await localforage.getItem("customApiKey");
-        if (cachedKey) {
-          setCustomApiKey(cachedKey as string);
-          setTempApiKey(cachedKey as string);
-        }
         const cachedModel = await localforage.getItem("selectedModel");
-        if (cachedModel) {
-          setSelectedModel(cachedModel as string);
-          setTempModel(cachedModel as string);
+        if (cachedModel !== null && cachedModel !== undefined) {
+          setSelectedModel(cachedModel as number);
+          setTempModel(cachedModel as number);
         }
       } catch (err) {
         console.error("Failed to load resume from cache", err);
@@ -207,30 +275,29 @@ export default function App() {
   };
 
   const handleSaveSettings = async () => {
-    setCustomApiKey(tempApiKey);
     setSelectedModel(tempModel);
-    await localforage.setItem("customApiKey", tempApiKey);
     await localforage.setItem("selectedModel", tempModel);
     setIsSettingsOpen(false);
   };
 
-  const getAiInstance = () => {
-    return new GoogleGenAI({ apiKey: customApiKey || process.env.GEMINI_API_KEY });
-  };
-
-  const generateContentWithFallback = async (ai: GoogleGenAI, baseOptions: any) => {
-    try {
-      return await ai.models.generateContent({
-        ...baseOptions,
-        model: selectedModel
-      });
-    } catch (error) {
-      console.warn(`Primary model '${selectedModel}' failed. Falling back to 'gemini-3-flash-preview'. Error:`, error);
-      return await ai.models.generateContent({
-        ...baseOptions,
-        model: "gemini-3-flash-preview"
-      });
+  const callLLM = async (messages: { role: string; content: string }[], options?: { responseFormat?: string; temperature?: number; maxTokens?: number }): Promise<string> => {
+    const res = await fetch(`${API_BASE_URL}/api/llm/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages,
+        model_index: selectedModel,
+        response_format: options?.responseFormat || null,
+        temperature: options?.temperature ?? 0.7,
+        max_tokens: options?.maxTokens ?? 8192,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Unknown error" }));
+      throw new Error(typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail));
     }
+    const data = await res.json();
+    return data.text;
   };
 
   const handleFetchJD = async () => {
@@ -238,7 +305,7 @@ export default function App() {
     setIsFetchingUrl(true);
     setError(null);
     try {
-      const res = await fetch("/api/fetch-jd", {
+      const res = await fetch(`${API_BASE_URL}/api/fetch-jd`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: jdUrl })
@@ -249,13 +316,12 @@ export default function App() {
       
       // Attempt to auto-extract company name
       try {
-        const ai = getAiInstance();
-        const companyRes = await generateContentWithFallback(ai, {
-           contents: `Extract ONLY the Company Name from this job description. Do not include any other text, quotes, or punctuation. If you cannot reliably determine the company name, reply with exactly "UNKNOWN".\n\nJob Description snippet:\n${data.text.substring(0, 3000)}`
-        });
-        const extracted = companyRes.text?.trim() || "";
-        if (extracted && extracted !== "UNKNOWN") {
-          setCompanyName(extracted);
+        const extracted = await callLLM([
+          { role: "user", content: `Extract ONLY the Company Name from this job description. Do not include any other text, quotes, or punctuation. If you cannot reliably determine the company name, reply with exactly "UNKNOWN".\n\nJob Description snippet:\n${data.text.substring(0, 3000)}` }
+        ]);
+        const trimmed = extracted.trim();
+        if (trimmed && trimmed !== "UNKNOWN") {
+          setCompanyName(trimmed);
         }
       } catch (extractErr) {
         console.error("Company extraction failed:", extractErr);
@@ -272,13 +338,12 @@ export default function App() {
     if (!jobDescription || isFetchingUrl) return;
     setIsFetchingUrl(true);
     try {
-      const ai = getAiInstance();
-      const companyRes = await generateContentWithFallback(ai, {
-         contents: `Extract ONLY the Company Name from this job description. Do not include any other text, quotes, or punctuation. If you cannot reliably determine the company name, reply with exactly "UNKNOWN".\n\nJob Description snippet:\n${jobDescription.substring(0, 3000)}`
-      });
-      const extracted = companyRes.text?.trim() || "";
-      if (extracted && extracted !== "UNKNOWN") {
-        setCompanyName(extracted);
+      const extracted = await callLLM([
+        { role: "user", content: `Extract ONLY the Company Name from this job description. Do not include any other text, quotes, or punctuation. If you cannot reliably determine the company name, reply with exactly "UNKNOWN".\n\nJob Description snippet:\n${jobDescription.substring(0, 3000)}` }
+      ]);
+      const trimmed = extracted.trim();
+      if (trimmed && trimmed !== "UNKNOWN") {
+        setCompanyName(trimmed);
       } else {
         alert("Could not detect company name from the description.");
       }
@@ -359,154 +424,195 @@ export default function App() {
       setError("Job description is required.");
       return;
     }
-    if (!resumeText.trim() && !resumeFile) {
+    
+    // Check if we have any valid resume data
+    const hasActiveResume = Boolean(resumeText.trim() || resumeFile);
+    const hasProfilesToSearch = autoSelectBestResume && resumeProfiles.some(p => p.text.trim() || p.file);
+
+    if (!hasActiveResume && !hasProfilesToSearch) {
       setError("Please provide your resume by uploading a PDF or pasting the text.");
       return;
     }
 
     setIsLoading(true);
+    isCancelledRef.current = false;
     setError(null);
     setResult(null);
 
     try {
-      const ai = getAiInstance();
-      const prompt = `
-You are an expert technical recruiter and career coach.
-Your task is to analyze the provided Resume against the provided Job Description to determine the fit.
+      let targetText = resumeText;
+      let targetFile = resumeFile;
+      let targetProfileId = activeProfileId;
 
-${isBlindMode ? "CRITICAL INSTRUCTION FOR BLIND MODE: Analyze this resume strictly and purely on the basis of skills and experience. Explicitly ignore and do not mention any demographic details such as name, location, graduation years, or any identifying markers to completely prevent any unconscious bias. Focus 100% on the alignment of the candidate's history to the requested job skills." : ""}
+      if (autoSelectBestResume && resumeProfiles.length > 1) {
+        let selectionPrompt = `You are an expert recruiter. I have ${resumeProfiles.length} resume variants. Compare them against the Job Description and select the BEST fit. Return a JSON object with 'bestProfileId' (the ID of the selected resume) and 'reason'.\n\nJob Description:\n${jobDescription.substring(0, 3000)}\n\n`;
 
-Evaluate the fit based on 10 parameters (e.g., Technical Skills, Experience Level, Education, Culture Fit, Industry Knowledge, Tooling, Problem Solving, Soft Skills, Leadership, Communication, or other relevant ones based on the JD).
-For each parameter, provide a score from 0 to 10 and a brief reason.
-Provide a total fit score from 0 to 100.
-Based on the total score, decide if the candidate should "Apply", "Maybe Apply", or "Not Apply".
-If a Company Name is provided, use your internal knowledge about the company culture, salary range for similar roles, and growth opportunities. If no company name is provided, try to extract it from the JD first. Include a summary of your findings as 'companyContext'.
-Also, extract the top 10 most critical skills for this role, and note if the candidate has each skill based on their resume.
+        for (const profile of resumeProfiles) {
+          selectionPrompt += `\n\n--- RESUME VARIANT [ID: ${profile.id}] (Name: ${profile.name}) ---\n`;
+          selectionPrompt += profile.text.substring(0, 3000) || "(PDF uploaded — text not available)";
+        }
 
-${checkUKSponsorship ? "CRITICAL INSTRUCTION: The user also wants to know if this company offers UK Skilled Worker Visa Sponsorship. Evaluate if this company is a known UK licensed sponsor for Skilled Worker visas. If you know they sponsor, indicate 'Yes'. If you know they do not, indicate 'No'. If you are unsure, say 'Unknown'. Make sure to mention this specifically in the 'companyContext' as well." : ""}
+        try {
+          const selectionRaw = await callLLM(
+            [{ role: "user", content: selectionPrompt }],
+            { responseFormat: "json" }
+          );
+          if (isCancelledRef.current) return;
+          
+          const jsonMatch = selectionRaw.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+          const cleanText = jsonMatch ? jsonMatch[1].trim() : selectionRaw.trim();
+          
+          const selectionJson = JSON.parse(cleanText);
+          if (selectionJson.bestProfileId) {
+            const bestProfile = resumeProfiles.find(p => p.id === selectionJson.bestProfileId);
+            if (bestProfile) {
+              targetText = bestProfile.text;
+              targetFile = bestProfile.file || null;
+              targetProfileId = bestProfile.id;
+              
+              // Ensure UI reflects the chosen variant and we update its text/ID
+              setActiveProfileId(bestProfile.id);
+              setResumeText(bestProfile.text);
+              setResumeFile(bestProfile.file || null);
+            }
+          }
+        } catch (e) {
+          console.error("Auto-select failed, falling back to active resume", e);
+        }
+      }
 
-Company Name: ${companyName || "Extract from JD if possible"}
+      const resumeContent = targetText || "(PDF uploaded — please paste the resume text for best results)";
+
+      const systemPrompt = `You are an expert technical recruiter and career coach. You MUST respond with ONLY valid JSON matching this exact schema — no markdown, no explanation, no code fences, just the raw JSON object:
+
+{
+  "fitScore": <integer 0-100>,
+  "fitDecision": "<exactly 'Apply', 'Maybe Apply', or 'Not Apply'>",
+  "parameters": [
+    { "name": "<string>", "score": <integer 0-10>, "reason": "<string>" }
+  ],
+  "companyContext": "<markdown string about company culture, salary range, growth opportunities>",
+  "strengths": ["<string>", ...],
+  "weaknesses": ["<string>", ...],
+  "ukSponsorshipStatus": "<exactly 'Yes', 'No', or 'Unknown'>",
+  "extractedJobTitle": "<string>",
+  "topSkills": [
+    { "name": "<string>", "hasSkill": <boolean>, "type": "<'Hard' or 'Soft'>" }
+  ],
+  "atsParseability": {
+    "isParseable": <boolean>,
+    "issues": ["<string>", ...],
+    "suggestions": ["<string>", ...]
+  },
+  "resumeTailoring": [
+    { "originalPoint": "<string>", "suggestedPoint": "<string>", "reason": "<string>" }
+  ]
+}
+
+Requirements:
+- Evaluate the fit based on exactly 10 parameters (Technical Skills, Experience Level, Education, Culture Fit, Industry Knowledge, Tooling, Problem Solving, Soft Skills, Leadership, Communication, or other relevant ones based on the JD).
+- Extract the top 10 most critical skills for this role and note whether the candidate has each skill.
+- Analyze the resume for ATS compliance.
+- Suggest 3-5 rewritten bullet points that better align with the JD terminology.
+${isBlindMode ? "\nCRITICAL BLIND MODE: Analyze purely on skills and experience. Ignore all demographic details (name, location, graduation years, identifying markers). Focus 100% on skill alignment." : ""}`;
+
+      const userPrompt = `Company Name: ${companyName || "Extract from JD if possible"}
+
 Job Description:
 ${jobDescription}
 
 Resume:
-${resumeText ? resumeText : "See attached document."}
-`;
+${resumeContent}`;
 
-      const contentsPart: any[] = [];
-      if (resumeFile) {
-        contentsPart.push({
-          inlineData: {
-            mimeType: resumeFile.mimeType,
-            data: resumeFile.data,
-          },
-        });
-      }
-      contentsPart.push({ text: prompt });
-
-      const requestConfig: any = {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            fitScore: { type: Type.INTEGER, description: "Total fit score from 0 to 100" },
-            fitDecision: { type: Type.STRING, description: "Exactly 'Apply', 'Maybe Apply', or 'Not Apply'" },
-            parameters: {
-              type: Type.ARRAY,
-              description: "Exactly 10 evaluation parameters",
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  score: { type: Type.INTEGER, description: "Score from 0 to 10" },
-                  reason: { type: Type.STRING },
-                },
-                required: ["name", "score", "reason"],
-              },
-            },
-            companyContext: {
-              type: Type.STRING,
-              description: "Markdown formatted string summarizing the web search findings regarding company culture, salary range, growth opportunities, and work-life balance.",
-            },
-            strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
-            weaknesses: { type: Type.ARRAY, items: { type: Type.STRING } },
-            ukSponsorshipStatus: { type: Type.STRING, description: "Exactly 'Yes', 'No', or 'Unknown'." },
-            extractedJobTitle: { type: Type.STRING, description: "The job title extracted from the job description" },
-            topSkills: {
-              type: Type.ARRAY,
-              description: "Exactly 10 critical skills for the role, and whether the candidate has them. Determine if they are Hard or Soft skills.",
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  hasSkill: { type: Type.BOOLEAN },
-                  type: { type: Type.STRING, description: "Either 'Hard' or 'Soft'" }
-                },
-                required: ["name", "hasSkill", "type"]
-              }
-            },
-            atsParseability: {
-              type: Type.OBJECT,
-              description: "Analyze the resume for ATS compliance (complex formatting, missing standard headers like 'Experience', missing contact info).",
-              properties: {
-                isParseable: { type: Type.BOOLEAN },
-                issues: { type: Type.ARRAY, items: { type: Type.STRING } },
-                suggestions: { type: Type.ARRAY, items: { type: Type.STRING } }
-              },
-              required: ["isParseable", "issues", "suggestions"]
-            },
-            resumeTailoring: {
-              type: Type.ARRAY,
-              description: "Suggest 3-5 rewritten bullet points from the resume that better align with the job description terminology.",
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  originalPoint: { type: Type.STRING },
-                  suggestedPoint: { type: Type.STRING },
-                  reason: { type: Type.STRING }
-                },
-                required: ["originalPoint", "suggestedPoint", "reason"]
-              }
-            }
-          },
-          required: [
-            "fitScore",
-            "fitDecision",
-            "parameters",
-            "companyContext",
-            "strengths",
-            "weaknesses",
-            "topSkills",
-            "extractedJobTitle",
-            "atsParseability",
-            "resumeTailoring"
-          ],
-        },
+      const fetchVisaStatus = async (): Promise<{ status: string, reason: string } | null> => {
+        if (!checkUKSponsorship || isManualSponsorship || !companyName.trim()) return null;
+        try {
+          const res = await fetch(`${API_BASE_URL}/api/check-visa`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ company_name: companyName, country: "UK" })
+          });
+          if (!res.ok) throw new Error("Failed to check visa");
+          const data = await res.json();
+          return { status: data.sponsors_visa, reason: data.reason };
+        } catch (e) {
+          console.error("Visa check failed", e);
+          return null;
+        }
       };
 
-      if (checkUKSponsorship) {
-        requestConfig.tools = [{ googleSearch: {} }];
-      }
+      const fetchMarketIntel = async (): Promise<string | null> => {
+        if (!companyName.trim()) return null;
+        try {
+          // Attempt to extract Job Title early for better searching
+          let tempJobTitle = jobDescription.split("\n")[0].slice(0, 50) || "Job Role";
+          
+          const res = await fetch(`${API_BASE_URL}/api/market-intel`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ company_name: companyName, job_title: tempJobTitle })
+          });
+          if (!res.ok) throw new Error("Failed to fetch market intel");
+          const data = await res.json();
+          return data.market_intel;
+        } catch (e) {
+          console.error("Market Intel fetch failed", e);
+          return null;
+        }
+      };
 
-      const response = await generateContentWithFallback(ai, {
-        contents: { parts: contentsPart },
-        config: requestConfig,
-      });
+      const [rawText, visaData, liveMarketIntel] = await Promise.all([
+        callLLM(
+          [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          { responseFormat: "json", maxTokens: 16384 }
+        ),
+        fetchVisaStatus(),
+        fetchMarketIntel()
+      ]);
+      if (isCancelledRef.current) return;
 
-      const responseText = response.text;
-      if (responseText) {
-        const rawJson = JSON.parse(responseText);
+      const jsonMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+      const cleanText = jsonMatch ? jsonMatch[1].trim() : rawText.trim();
+
+      if (cleanText) {
+        const rawJson = JSON.parse(cleanText);
+        
+        let finalSponsorship = isManualSponsorship ? "Yes" : (checkUKSponsorship ? "Unknown" : "Not Checked");
+        let contextAddition = "";
+        
+        if (visaData) {
+           finalSponsorship = visaData.status;
+           contextAddition = `\n\n---\n**Live Visa Sponsorship Check:** ${visaData.status} - ${visaData.reason}`;
+        } else if (rawJson.ukSponsorshipStatus && !isManualSponsorship && checkUKSponsorship) {
+           finalSponsorship = rawJson.ukSponsorshipStatus;
+        }
+
+        // Use the live market intel if available, otherwise fall back to what the LLM generated.
+        const baseCompanyContext = liveMarketIntel ? `**Live Market Intelligence:**\n\n${liveMarketIntel}` : rawJson.companyContext;
+
         const newResult: FitAnalysisResult = {
           ...rawJson,
+          companyContext: baseCompanyContext,
           id: crypto.randomUUID(),
           userId: user?.uid,
           timestamp: new Date().toISOString(),
           companyName: companyName || "Unknown Company",
           jobTitle: rawJson.extractedJobTitle || jobDescription.split("\n")[0].slice(0, 50) || "Job Role",
           jobDescription,
-          resumeText,
+          resumeText: targetText,
           jdUrl: jdUrl || undefined,
+          ukSponsorshipStatus: finalSponsorship as any,
+          applicationStatus: currentApplicationStatus,
+          resumeProfileName: resumeProfiles.find(p => p.id === targetProfileId)?.name || "Unknown Profile",
         };
+        
+        if (contextAddition) {
+           newResult.companyContext = newResult.companyContext + contextAddition;
+        }
+        
         setResult(newResult);
         setShowInputs(false);
         
@@ -541,7 +647,6 @@ ${resumeText ? resumeText : "See attached document."}
     setIsGeneratingEmail(true);
     setGeneratedEmail("");
     try {
-      const ai = getAiInstance();
       const ctxDate = new Date().toISOString();
       const prompt = `You are a professional, confident, and highly emotionally intelligent job candidate. 
 You need to write a reply email to a recruiter/hiring manager based on the provided email chain context.
@@ -565,12 +670,12 @@ Draft the reply email. Provide ONLY the email text (including subject if needed)
 Email Chain Context:
 ${emailThread}`;
 
-      const response = await generateContentWithFallback(ai, {
-        contents: prompt,
-      });
+      const responseText = await callLLM([
+        { role: "user", content: prompt },
+      ]);
 
-      if (response.text) {
-        setGeneratedEmail(response.text);
+      if (responseText) {
+        setGeneratedEmail(responseText);
       }
     } catch (err) {
       console.error(err);
@@ -585,7 +690,6 @@ ${emailThread}`;
     setIsGeneratingExtra(type);
     
     try {
-      const ai = getAiInstance();
       let prompt = "";
       if (type === "coverLetter") {
         prompt = `You are an expert career coach. Based on the following Fit Analysis Report, job description, and resume, write a highly tailored, professional Cover Letter bridging the candidate's specific experience to the job's needs. Also, provide a short bulleted list of suggested resume tweaks (Resume Tailoring Actions) at the end. Use markdown format.`;
@@ -613,11 +717,10 @@ Candidate Resume Summary:
 ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/weaknesses"}
 `;
 
-      const response = await generateContentWithFallback(ai, {
-        contents: `${prompt}\n\n${ctx}`,
-      });
+      const responseText = await callLLM([
+        { role: "user", content: `${prompt}\n\n${ctx}` },
+      ]);
 
-      const responseText = response.text;
       if (responseText) {
         const updatedResult = { ...result, [type]: responseText };
         setResult(updatedResult);
@@ -669,6 +772,56 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
       } catch (dbErr) {
         handleFirestoreError(dbErr, OperationType.UPDATE, `users/${user.uid}/history/${id}`);
       }
+    }
+  };
+
+  const handleAddManualHistory = async () => {
+    if (!user) return;
+    if (!manualEntry.companyName || !manualEntry.jobTitle) {
+      alert("Company Name and Job Title are required.");
+      return;
+    }
+
+    const newItem: FitAnalysisResult = {
+      id: Math.random().toString(36).substring(2, 9),
+      timestamp: new Date().toISOString(),
+      companyName: manualEntry.companyName,
+      jobTitle: manualEntry.jobTitle,
+      fitScore: manualEntry.fitScore,
+      fitDecision: manualEntry.fitDecision,
+      parameters: [],
+      companyContext: "Manually added record",
+      strengths: [],
+      weaknesses: [],
+      applicationStatus: manualEntry.applicationStatus,
+      ukSponsorshipStatus: manualEntry.ukSponsorshipStatus,
+      jdUrl: manualEntry.jdUrl,
+      jobDescription: "Manually added record",
+      resumeText: "Manually added record",
+      resumeProfileName: "Manual Entry",
+    };
+
+    try {
+      const newHistory = [newItem, ...history];
+      setHistory(newHistory);
+      await localforage.setItem("history", newHistory);
+      
+      const docRef = doc(db, `users/${user.uid}/history`, newItem.id);
+      await setDoc(docRef, newItem);
+      
+      setIsAddManualOpen(false);
+      setManualEntry({
+        companyName: "",
+        jobTitle: "",
+        fitScore: 70,
+        fitDecision: "Maybe Apply",
+        ukSponsorshipStatus: "Unknown",
+        applicationStatus: "Saved",
+        jdUrl: ""
+      });
+    } catch (error) {
+      console.error("Error adding manual entry:", error);
+      handleFirestoreError(error, OperationType.CREATE, `users/${user.uid}/history/${newItem.id}`);
     }
   };
 
@@ -848,7 +1001,7 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
         </div>
       )}
 
-      <main className="flex-1 max-w-7xl mx-auto w-full p-4 md:p-6 lg:p-8 space-y-8">
+      <main className="flex-1 max-w-7xl mx-auto w-full min-w-0 p-4 md:p-6 lg:p-8 space-y-8">
         {currentView === "analysis" ? (
           <React.Fragment>
             <header className="mb-8">
@@ -912,12 +1065,13 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
                     <input 
                       type="checkbox" 
                       id="ukSponsorship"
-                      className="mt-1 accent-[#D4AF37] w-3 h-3 bg-white/5 border-white/20 rounded-sm"
+                      className="mt-1 accent-[#D4AF37] w-3 h-3 bg-white/5 border-white/20 rounded-sm disabled:opacity-50"
                       checked={checkUKSponsorship}
+                      disabled={isManualSponsorship}
                       onChange={(e) => setCheckUKSponsorship(e.target.checked)}
                     />
                     <div>
-                      <Label htmlFor="ukSponsorship" className="cursor-pointer text-[11px] font-bold tracking-wide">
+                      <Label htmlFor="ukSponsorship" className={cn("cursor-pointer text-[11px] font-bold tracking-wide", isManualSponsorship && "opacity-50")}>
                         Check for UK Sponsorship Eligibility
                       </Label>
                       <p className="text-[10px] text-white/40 uppercase tracking-widest mt-1">
@@ -925,13 +1079,94 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
                       </p>
                     </div>
                   </div>
+
+                  <div className="flex items-start gap-2 pt-2 pb-1">
+                    <input 
+                      type="checkbox" 
+                      id="manualSponsorship"
+                      className="mt-1 accent-[#D4AF37] w-3 h-3 bg-white/5 border-white/20 rounded-sm"
+                      checked={isManualSponsorship}
+                      onChange={(e) => {
+                        setIsManualSponsorship(e.target.checked);
+                        if (e.target.checked) setCheckUKSponsorship(false);
+                      }}
+                    />
+                    <div>
+                      <Label htmlFor="manualSponsorship" className="cursor-pointer text-[11px] font-bold tracking-wide">
+                        Visa Sponsorship Already Verified
+                      </Label>
+                      <p className="text-[10px] text-[#D4AF37] uppercase tracking-widest mt-1 font-bold">
+                        Bypasses AI web search and marks as "Sponsored"
+                      </p>
+                    </div>
+                  </div>
                   <p className="text-[10px] text-white/40 uppercase tracking-widest mt-1">
                     Provides better web search context
                   </p>
                 </div>
+
+                <div className="flex items-start gap-2 pt-2 pb-1 border-t border-white/5 mt-4">
+                  <input 
+                    type="checkbox" 
+                    id="autoSelectResume"
+                    className="mt-1 accent-[#D4AF37] w-3 h-3 bg-white/5 border-white/20 rounded-sm disabled:opacity-50"
+                    checked={autoSelectBestResume}
+                    disabled={resumeProfiles.length <= 1}
+                    onChange={(e) => setAutoSelectBestResume(e.target.checked)}
+                  />
+                  <div>
+                    <Label htmlFor="autoSelectResume" className={cn("cursor-pointer text-[11px] font-bold tracking-wide", resumeProfiles.length <= 1 && "opacity-50")}>
+                      Auto-Select Best Resume Variant
+                    </Label>
+                    <p className="text-[10px] text-[#D4AF37] uppercase tracking-widest mt-1 font-bold">
+                      Compare all profiles and evaluate using the best match
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5 pb-2">
+                  <Label htmlFor="currentStatus" className="text-[10px] uppercase font-bold tracking-widest text-white/50">Initial Application Status</Label>
+                  <select 
+                    id="currentStatus"
+                    value={currentApplicationStatus}
+                    onChange={(e) => setCurrentApplicationStatus(e.target.value as ApplicationStatus)}
+                    className="w-full h-9 px-3 text-sm bg-[#0A0A0A] border border-white/10 text-white rounded-md focus:outline-none focus:border-[#D4AF37]"
+                  >
+                    <option value="Saved">Saved</option>
+                    <option value="Applied">Applied</option>
+                    <option value="Interview">Interview</option>
+                    <option value="Round 1">Round 1</option>
+                    <option value="Round 2">Round 2</option>
+                    <option value="Round 3">Round 3</option>
+                    <option value="Final Round">Final Round</option>
+                    <option value="Offer">Offer</option>
+                    <option value="Rejected">Rejected</option>
+                    <option value="Ghosted">Ghosted</option>
+                    <option value="Withdrawn">Withdrawn</option>
+                  </select>
+                </div>
+
                 <div className="space-y-2 flex-1 flex flex-col">
                   <div className="flex justify-between items-end">
                     <Label htmlFor="jd">Job Description *</Label>
+                    {jobDescription && (
+                      <button 
+                        onClick={() => handleCopy(jobDescription)}
+                        className="text-[10px] text-white/40 hover:text-[#D4AF37] flex items-center gap-1 transition-colors"
+                      >
+                        {copiedId === "jd" ? (
+                          <React.Fragment>
+                            <Check className="w-3 h-3 text-green-400" />
+                            <span className="text-green-400">Copied!</span>
+                          </React.Fragment>
+                        ) : (
+                          <React.Fragment>
+                            <Copy className="w-3 h-3" />
+                            <span>Copy Text</span>
+                          </React.Fragment>
+                        )}
+                      </button>
+                    )}
                   </div>
                   
                   <div className="flex gap-2">
@@ -1064,24 +1299,32 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
               </CardContent>
             </Card>
 
-            <Button
-              size="lg"
-              className="w-full shadow-lg hover:shadow-[#D4AF37]/20 transition-all"
-              onClick={handleAnalyze}
-              disabled={isLoading}
-            >
-              {isLoading ? (
-                <>
-                  <RefreshCw className="w-4 h-4 mr-3 animate-spin opacity-70" />
+            {isLoading ? (
+              <Button
+                size="lg"
+                className="w-full shadow-lg transition-all flex items-center justify-between px-6 bg-white/5 hover:bg-white/10"
+                onClick={handleCancelAnalyze}
+                variant="outline"
+              >
+                <div className="flex items-center text-white/70">
+                  <RefreshCw className="w-4 h-4 mr-3 animate-spin" />
                   Analyzing Fit & Researching Role...
-                </>
-              ) : (
-                <>
-                  <Search className="w-4 h-4 mr-3 opacity-70" />
-                  Execute Analysis
-                </>
-              )}
-            </Button>
+                </div>
+                <div className="flex items-center text-red-400 font-bold uppercase tracking-widest text-xs">
+                  <X className="w-4 h-4 mr-1" />
+                  Cancel
+                </div>
+              </Button>
+            ) : (
+              <Button
+                size="lg"
+                className="w-full shadow-lg hover:shadow-[#D4AF37]/20 transition-all bg-white text-black hover:bg-[#D4AF37] hover:text-black"
+                onClick={handleAnalyze}
+              >
+                <Search className="w-4 h-4 mr-3 opacity-70" />
+                Execute Analysis
+              </Button>
+            )}
 
             {error && (
               <div className="p-4 bg-[#FF4444]/10 text-[#FF4444] border border-[#FF4444]/20 rounded-sm text-xs flex items-start gap-3 uppercase tracking-widest leading-relaxed font-bold">
@@ -1094,7 +1337,7 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
           {/* RIGHT: Results */}
           <div className="h-full">
             {result ? (
-              <div className="space-y-6 flex flex-col h-full animate-in fade-in slide-in-from-bottom-8 duration-700">
+              <div id="report-container" className="space-y-6 flex flex-col h-full animate-in fade-in slide-in-from-bottom-8 duration-700">
                 
                 <div className="mb-2">
                   <h2 className="text-2xl font-serif text-white">{result.jobTitle}</h2>
@@ -1215,22 +1458,63 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
                         </CardContent>
                       </Card>
 
-                      {result.ukSponsorshipStatus && result.ukSponsorshipStatus !== "Not Checked" && (
-                        <Card className="flex-1 bg-white/5 border-white/10">
-                          <CardContent className="flex flex-col items-center justify-center p-6 text-center h-full">
-                            <div className="text-[10px] text-white/50 uppercase tracking-[0.2em] mb-2 font-bold flex items-center justify-center gap-1">
-                              UK Sponsorship
-                            </div>
-                            <div className={cn(
-                              "text-xl font-serif italic flex items-center tracking-wide",
+                      <Card className="flex-1 bg-white/5 border-white/10">
+                        <CardContent className="flex flex-col items-center justify-center p-6 text-center h-full">
+                          <div className="text-[10px] text-white/50 uppercase tracking-[0.2em] mb-2 font-bold flex items-center justify-center gap-1">
+                            Resume Variant
+                          </div>
+                          <div className="text-sm font-medium text-white/80 whitespace-nowrap overflow-hidden text-ellipsis max-w-[150px]">
+                            {result.resumeProfileName || "Unknown Profile"}
+                          </div>
+                        </CardContent>
+                      </Card>
+
+                      <Card className="flex-1 bg-white/5 border-white/10">
+                        <CardContent className="flex flex-col items-center justify-center p-6 text-center h-full">
+                          <div className="text-[10px] text-white/50 uppercase tracking-[0.2em] mb-2 font-bold flex items-center justify-center gap-1">
+                            UK Sponsorship
+                          </div>
+                          <select 
+                            value={result.ukSponsorshipStatus || "Not Checked"}
+                            onChange={(e) => handleUpdateHistoryItem(result.id, { ukSponsorshipStatus: e.target.value as any })}
+                            className={cn(
+                              "bg-transparent text-xl font-serif italic text-center outline-none cursor-pointer hover:opacity-80 transition-opacity",
                               result.ukSponsorshipStatus === "Yes" ? "text-green-400" :
                               result.ukSponsorshipStatus === "No" ? "text-red-400" : "text-white/70"
-                            )}>
-                              {result.ukSponsorshipStatus}
-                            </div>
-                          </CardContent>
-                        </Card>
-                      )}
+                            )}
+                          >
+                            <option value="Yes" className="bg-[#0A0A0A] text-green-400 text-sm py-2">Yes</option>
+                            <option value="No" className="bg-[#0A0A0A] text-red-400 text-sm py-2">No</option>
+                            <option value="Unknown" className="bg-[#0A0A0A] text-white/70 text-sm py-2">Unknown</option>
+                            <option value="Not Checked" className="bg-[#0A0A0A] text-white/50 text-sm py-2">Not Checked</option>
+                          </select>
+                        </CardContent>
+                      </Card>
+
+                      <Card className="flex-1 bg-white/5 border-white/10">
+                        <CardContent className="flex flex-col items-center justify-center p-6 text-center h-full">
+                          <div className="text-[10px] text-white/50 uppercase tracking-[0.2em] mb-2 font-bold flex items-center justify-center gap-1">
+                            Application Status
+                          </div>
+                          <select 
+                            value={result.applicationStatus || "Saved"}
+                            onChange={(e) => handleUpdateHistoryItem(result.id, { applicationStatus: e.target.value as ApplicationStatus })}
+                            className="bg-transparent text-xl font-serif italic text-white text-center outline-none cursor-pointer focus:text-[#D4AF37] transition-colors"
+                          >
+                            <option value="Saved" className="bg-[#0A0A0A] text-sm py-2">Saved</option>
+                            <option value="Applied" className="bg-[#0A0A0A] text-sm py-2">Applied</option>
+                            <option value="Interview" className="bg-[#0A0A0A] text-sm py-2">Interview</option>
+                            <option value="Round 1" className="bg-[#0A0A0A] text-sm py-2">Round 1</option>
+                            <option value="Round 2" className="bg-[#0A0A0A] text-sm py-2">Round 2</option>
+                            <option value="Round 3" className="bg-[#0A0A0A] text-sm py-2">Round 3</option>
+                            <option value="Final Round" className="bg-[#0A0A0A] text-sm py-2">Final Round</option>
+                            <option value="Offer" className="bg-[#0A0A0A] text-sm py-2">Offer</option>
+                            <option value="Rejected" className="bg-[#0A0A0A] text-sm py-2">Rejected</option>
+                            <option value="Ghosted" className="bg-[#0A0A0A] text-sm py-2">Ghosted</option>
+                            <option value="Withdrawn" className="bg-[#0A0A0A] text-sm py-2">Withdrawn</option>
+                          </select>
+                        </CardContent>
+                      </Card>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
@@ -1293,8 +1577,23 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
                 {activeTab === "jobDescription" && (
                   <div className="space-y-6 animate-in fade-in">
                     <Card className="bg-[#111] border-white/5 ring-1 ring-white/5 shadow-none mt-4">
-                      <CardHeader className="border-b border-white/5 pb-4">
+                      <CardHeader className="border-b border-white/5 pb-4 flex flex-row items-center justify-between space-y-0">
                         <CardTitle>Job Description Original Text</CardTitle>
+                        <Button 
+                          variant="ghost" 
+                          size="sm" 
+                          onClick={() => handleCopy(result.jobDescription, "result-jd")}
+                          className="h-8 px-2 text-white/50 hover:text-[#D4AF37] hover:bg-white/5"
+                        >
+                          {copiedId === "result-jd" ? (
+                            <Check className="w-4 h-4 text-green-400 mr-1.5" />
+                          ) : (
+                            <Copy className="w-4 h-4 mr-1.5" />
+                          )}
+                          <span className="text-xs uppercase tracking-widest font-bold">
+                            {copiedId === "result-jd" ? "Copied" : "Copy"}
+                          </span>
+                        </Button>
                       </CardHeader>
                       <CardContent className="pt-4">
                         <div className="prose prose-sm prose-invert max-w-none">
@@ -1611,7 +1910,49 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
                   <Button 
                     variant="outline"
                     className="w-full md:w-auto border-white/20 text-white/70 hover:bg-white/5"
-                    onClick={() => window.print()}
+                    onClick={() => {
+                      Promise.all([
+                        import('html-to-image'),
+                        import('jspdf')
+                      ]).then(([htmlToImage, jsPDF]) => {
+                        const element = document.getElementById('report-container');
+                        if (!element) return;
+                        
+                        htmlToImage.toCanvas(element, { backgroundColor: '#0A0A0A', pixelRatio: 2 })
+                          .then((canvas) => {
+                            const imgData = canvas.toDataURL('image/jpeg', 0.98);
+                            const pdf = new jsPDF.jsPDF({
+                              orientation: 'portrait',
+                              unit: 'in',
+                              format: 'letter'
+                            });
+                            
+                            const margin = 0.5;
+                            const imgWidth = pdf.internal.pageSize.getWidth() - margin * 2;
+                            const pageHeight = pdf.internal.pageSize.getHeight() - margin * 2;
+                            const imgHeight = (canvas.height * imgWidth) / canvas.width;
+                            
+                            let heightLeft = imgHeight;
+                            let position = margin;
+                            
+                            pdf.addImage(imgData, 'JPEG', margin, position, imgWidth, imgHeight);
+                            heightLeft -= pageHeight;
+                            
+                            while (heightLeft > 0) {
+                              position -= pageHeight;
+                              pdf.addPage();
+                              pdf.addImage(imgData, 'JPEG', margin, position, imgWidth, imgHeight);
+                              heightLeft -= pageHeight;
+                            }
+                            
+                            pdf.save(`${result.jobTitle.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_report.pdf`);
+                          })
+                          .catch((err) => {
+                            console.error('Error generating PDF:', err);
+                            alert('An error occurred while generating the PDF. Please try again.');
+                          });
+                      });
+                    }}
                   >
                     <Download className="w-4 h-4 mr-2" />
                     Download PDF
@@ -1634,10 +1975,139 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
       </React.Fragment>
     ) : (
           <div className="animate-in fade-in duration-700">
-            <header className="mb-8">
-              <h1 className="text-3xl font-serif italic text-white uppercase tracking-tighter">Historical Data</h1>
-              <p className="mt-2 text-sm text-white/50">Your past analysis reports, stored locally for your review.</p>
+            <header className="mb-8 flex flex-col md:flex-row md:items-end justify-between gap-4">
+              <div>
+                <h1 className="text-3xl font-serif italic text-white uppercase tracking-tighter">Historical Data</h1>
+                <p className="mt-2 text-sm text-white/50">Your past analysis reports, stored locally for your review.</p>
+              </div>
+              <Button 
+                onClick={() => setIsAddManualOpen(true)}
+                className="bg-[#D4AF37] hover:bg-[#B8962E] text-black font-bold uppercase tracking-widest text-xs h-9"
+              >
+                <Plus className="w-4 h-4 mr-2" />
+                Add Manual Role
+              </Button>
             </header>
+
+            {isAddManualOpen && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-300">
+                <Card className="w-full max-w-lg bg-[#111] border-white/10 ring-1 ring-white/10 shadow-2xl overflow-hidden">
+                  <CardHeader className="border-b border-white/5 pb-4 flex flex-row items-center justify-between">
+                    <div>
+                      <CardTitle className="text-xl font-serif italic text-white">Manual History Entry</CardTitle>
+                      <p className="text-xs text-white/40 uppercase tracking-widest mt-1">Add a role without AI analysis</p>
+                    </div>
+                    <Button variant="ghost" size="sm" onClick={() => setIsAddManualOpen(false)} className="text-white/40 hover:text-white">
+                      <X className="w-5 h-5" />
+                    </Button>
+                  </CardHeader>
+                  <CardContent className="p-6 space-y-4">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="space-y-1.5">
+                        <Label htmlFor="manual-company" className="text-[10px] uppercase font-bold tracking-widest text-white/50">Company Name *</Label>
+                        <Input 
+                          id="manual-company"
+                          placeholder="e.g. Google"
+                          value={manualEntry.companyName}
+                          onChange={(e) => setManualEntry(prev => ({ ...prev, companyName: e.target.value }))}
+                          className="h-9 bg-[#0A0A0A] border-white/10 text-white text-sm"
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label htmlFor="manual-title" className="text-[10px] uppercase font-bold tracking-widest text-white/50">Job Title *</Label>
+                        <Input 
+                          id="manual-title"
+                          placeholder="e.g. Senior Software Engineer"
+                          value={manualEntry.jobTitle}
+                          onChange={(e) => setManualEntry(prev => ({ ...prev, jobTitle: e.target.value }))}
+                          className="h-9 bg-[#0A0A0A] border-white/10 text-white text-sm"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="space-y-1.5">
+                        <Label className="text-[10px] uppercase font-bold tracking-widest text-white/50">Fit Match Score: {manualEntry.fitScore}%</Label>
+                        <input 
+                          type="range"
+                          min="0"
+                          max="100"
+                          step="5"
+                          value={manualEntry.fitScore}
+                          onChange={(e) => setManualEntry(prev => ({ ...prev, fitScore: parseInt(e.target.value) }))}
+                          className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-[#D4AF37] mt-3"
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label className="text-[10px] uppercase font-bold tracking-widest text-white/50">Match Decision</Label>
+                        <select 
+                          value={manualEntry.fitDecision}
+                          onChange={(e) => setManualEntry(prev => ({ ...prev, fitDecision: e.target.value as any }))}
+                          className="w-full h-9 px-3 text-sm bg-[#0A0A0A] border border-white/10 text-white rounded-md focus:outline-none focus:border-[#D4AF37]"
+                        >
+                          <option value="Apply">Apply</option>
+                          <option value="Maybe Apply">Maybe Apply</option>
+                          <option value="Not Apply">Not Apply</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="space-y-1.5">
+                        <Label className="text-[10px] uppercase font-bold tracking-widest text-white/50">UK Visa Sponsorship</Label>
+                        <select 
+                          value={manualEntry.ukSponsorshipStatus}
+                          onChange={(e) => setManualEntry(prev => ({ ...prev, ukSponsorshipStatus: e.target.value as any }))}
+                          className="w-full h-9 px-3 text-sm bg-[#0A0A0A] border border-white/10 text-white rounded-md focus:outline-none focus:border-[#D4AF37]"
+                        >
+                          <option value="Yes">Sponsored (Yes)</option>
+                          <option value="No">Not Sponsored (No)</option>
+                          <option value="Unknown">Unknown</option>
+                        </select>
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label className="text-[10px] uppercase font-bold tracking-widest text-white/50">Application Status</Label>
+                        <select 
+                          value={manualEntry.applicationStatus}
+                          onChange={(e) => setManualEntry(prev => ({ ...prev, applicationStatus: e.target.value as any }))}
+                          className="w-full h-9 px-3 text-sm bg-[#0A0A0A] border border-white/10 text-white rounded-md focus:outline-none focus:border-[#D4AF37]"
+                        >
+                          <option value="Saved">Saved</option>
+                          <option value="Applied">Applied</option>
+                          <option value="Interview">Interview</option>
+                          <option value="Round 1">Round 1</option>
+                          <option value="Round 2">Round 2</option>
+                          <option value="Round 3">Round 3</option>
+                          <option value="Final Round">Final Round</option>
+                          <option value="Offer">Offer</option>
+                          <option value="Rejected">Rejected</option>
+                          <option value="Ghosted">Ghosted</option>
+                          <option value="Withdrawn">Withdrawn</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5 pt-2">
+                       <Label className="text-[10px] uppercase font-bold tracking-widest text-white/50">JD URL (Optional)</Label>
+                       <Input 
+                          placeholder="https://..."
+                          value={manualEntry.jdUrl}
+                          onChange={(e) => setManualEntry(prev => ({ ...prev, jdUrl: e.target.value }))}
+                          className="h-9 bg-[#0A0A0A] border-white/10 text-white text-sm"
+                        />
+                    </div>
+                  </CardContent>
+                  <CardContent className="p-6 pt-0 flex justify-end gap-3">
+                    <Button variant="outline" onClick={() => setIsAddManualOpen(false)} className="border-white/10 text-white">
+                      Cancel
+                    </Button>
+                    <Button onClick={handleAddManualHistory} className="bg-[#D4AF37] hover:bg-[#B8962E] text-black font-bold px-6">
+                      Save Record
+                    </Button>
+                  </CardContent>
+                </Card>
+              </div>
+            )}
 
             {history.length > 0 && (
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
@@ -1651,7 +2121,7 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
                   <CardContent className="p-4 flex flex-col items-center justify-center text-center">
                     <div className="text-[10px] text-white/40 uppercase tracking-widest font-bold mb-1">Avg Match Score</div>
                     <div className="text-3xl font-serif text-[#D4AF37]">
-                      {Math.round(history.reduce((acc, curr) => acc + curr.fitScore, 0) / history.length)}
+                      {history.length > 0 ? Math.round(history.reduce((acc, curr) => acc + curr.fitScore, 0) / history.length) : 0}
                     </div>
                   </CardContent>
                 </Card>
@@ -1667,27 +2137,121 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
                   <CardContent className="p-4 flex flex-col items-center justify-center text-center">
                     <div className="text-[10px] text-white/40 uppercase tracking-widest font-bold mb-1">Interviews/Offers</div>
                     <div className="text-3xl font-serif text-white">
-                      {history.filter(h => h.applicationStatus?.includes("Interview") || h.applicationStatus === "Offer").length}
+                      {history.filter(h => 
+                        h.applicationStatus?.includes("Interview") || 
+                        h.applicationStatus?.includes("Round") || 
+                        h.applicationStatus === "Offer"
+                      ).length}
                     </div>
                   </CardContent>
                 </Card>
               </div>
             )}
 
+            {history.length > 0 && (
+              <div className="mb-6 p-4 bg-white/[0.02] border border-white/5 rounded-sm space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+                  <div className="space-y-1.5 min-w-0">
+                    <Label className="text-[10px] uppercase tracking-widest text-white/40 font-bold truncate">Search</Label>
+                    <div className="relative">
+                      <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-white/20" />
+                      <Input 
+                        placeholder="Company or position..." 
+                        value={historySearch}
+                        onChange={(e) => setHistorySearch(e.target.value)}
+                        className="h-8 pl-8 text-xs bg-[#0A0A0A] border-white/10 text-white focus:border-[#D4AF37]"
+                      />
+                    </div>
+                  </div>
+                  
+                  <div className="space-y-1.5 min-w-0">
+                    <Label className="text-[10px] uppercase tracking-widest text-white/40 font-bold truncate">Min Score: {historyMinScore}%</Label>
+                    <input 
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="5"
+                      value={historyMinScore}
+                      onChange={(e) => setHistoryMinScore(parseInt(e.target.value))}
+                      className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-[#D4AF37] mt-2"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5 min-w-0">
+                    <Label className="text-[10px] uppercase tracking-widest text-white/40 font-bold truncate">Visa Sponsorship</Label>
+                    <select 
+                      value={historySponsorship}
+                      onChange={(e) => setHistorySponsorship(e.target.value as any)}
+                      className="w-full h-8 px-2 text-xs bg-[#0A0A0A] border border-white/10 text-white rounded-sm focus:outline-none focus:border-[#D4AF37]"
+                    >
+                      <option value="All">All Statuses</option>
+                      <option value="Yes">Sponsored (Yes)</option>
+                      <option value="No">Not Sponsored (No)</option>
+                      <option value="Unknown">Unknown</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1.5 min-w-0">
+                    <Label className="text-[10px] uppercase tracking-widest text-white/40 font-bold truncate">Decision</Label>
+                    <select 
+                      value={historyDecision}
+                      onChange={(e) => {
+                        setHistoryDecision(e.target.value as any);
+                        setHistoryPage(1);
+                      }}
+                      className="w-full h-8 px-2 text-xs bg-[#0A0A0A] border border-white/10 text-white rounded-sm focus:outline-none focus:border-[#D4AF37]"
+                    >
+                      <option value="All">All Decisions</option>
+                      <option value="Apply">Apply</option>
+                      <option value="Maybe Apply">Maybe Apply</option>
+                      <option value="Not Apply">Not Apply</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1.5 min-w-0">
+                    <Label className="text-[10px] uppercase tracking-widest text-white/40 font-bold truncate">Application Status</Label>
+                    <select 
+                      value={historyStatus}
+                      onChange={(e) => {
+                        setHistoryStatus(e.target.value as any);
+                        setHistoryPage(1);
+                      }}
+                      className="w-full h-8 px-2 text-xs bg-[#0A0A0A] border border-white/10 text-white rounded-sm focus:outline-none focus:border-[#D4AF37]"
+                    >
+                      <option value="All">All Statuses</option>
+                      <option value="Saved">Saved</option>
+                      <option value="Applied">Applied</option>
+                      <option value="Interview">Interview</option>
+                      <option value="Round 1">Round 1</option>
+                      <option value="Round 2">Round 2</option>
+                      <option value="Round 3">Round 3</option>
+                      <option value="Final Round">Final Round</option>
+                      <option value="Offer">Offer</option>
+                      <option value="Rejected">Rejected</option>
+                      <option value="Ghosted">Ghosted</option>
+                      <option value="Withdrawn">Withdrawn</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {history.length > 0 ? (
-              <div className="overflow-x-auto border border-white/10 bg-[#111] rounded-xl shadow-2xl">
+              <div className="overflow-x-auto custom-scrollbar border border-white/10 bg-[#111] rounded-xl shadow-2xl">
                 <table className="w-full text-left whitespace-nowrap">
                   <thead className="bg-[#0A0A0A] text-[10px] uppercase tracking-widest text-white/40 border-b border-white/10">
                     <tr>
                       <th className="px-6 py-4 font-medium">Company & Role</th>
                       <th className="px-6 py-4 font-medium text-center">Fit Score</th>
                       <th className="px-6 py-4 font-medium">Decision</th>
+                      <th className="px-6 py-4 font-medium">Resume</th>
+                      <th className="px-6 py-4 font-medium">UK Visa</th>
                       <th className="px-6 py-4 font-medium">Application Status</th>
                       <th className="px-6 py-4 font-medium text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/5">
-                    {history.map((h) => (
+                    {paginatedHistory.map((h) => (
                       <tr key={h.id} className="hover:bg-white/[0.02] transition-colors group">
                         <td className="px-6 py-4">
                           <div className="flex flex-col">
@@ -1754,6 +2318,30 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
                           </div>
                         </td>
                         <td className="px-6 py-4">
+                          <span className="text-[10px] bg-white/5 border border-white/10 px-2 py-1 rounded text-white/70 italic font-medium whitespace-nowrap">
+                            {h.resumeProfileName || "Unknown Profile"}
+                          </span>
+                        </td>
+                        <td className="px-6 py-4">
+                           <div className="flex items-center gap-2">
+                             <select
+                               value={h.ukSponsorshipStatus || "Unknown"}
+                               onChange={(e) => handleUpdateHistoryItem(h.id, { ukSponsorshipStatus: e.target.value as any })}
+                               className={cn(
+                                 "text-[10px] bg-[#0A0A0A] border rounded px-1.5 py-1 focus:outline-none focus:border-[#D4AF37] transition-colors cursor-pointer text-center font-bold uppercase tracking-tight",
+                                 h.ukSponsorshipStatus === "Yes" ? "!text-green-400 border-green-400/30" :
+                                 h.ukSponsorshipStatus === "No" ? "!text-red-400 border-red-400/30" :
+                                 "!text-white/50 border-white/10"
+                               )}
+                             >
+                               <option value="Yes" className="bg-[#0A0A0A] text-green-400">Sponsored</option>
+                               <option value="No" className="bg-[#0A0A0A] text-red-400">No Sponsor</option>
+                               <option value="Unknown" className="bg-[#0A0A0A] text-white/50">Unknown</option>
+                               <option value="Not Checked" className="bg-[#0A0A0A] text-white/30">Not Checked</option>
+                             </select>
+                           </div>
+                        </td>
+                        <td className="px-6 py-4">
                           <select
                             value={h.applicationStatus || "Saved"}
                             onChange={(e) => handleUpdateHistoryItem(h.id, { applicationStatus: e.target.value as ApplicationStatus })}
@@ -1809,6 +2397,52 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
                     ))}
                   </tbody>
                 </table>
+                {filteredHistory.length === 0 && (
+                  <div className="p-12 text-center bg-white/[0.01]">
+                    <Search className="w-8 h-8 text-white/10 mx-auto mb-4" />
+                    <p className="text-white/40 font-serif italic">No matching records found</p>
+                    <button 
+                      onClick={() => {
+                        setHistorySearch("");
+                        setHistoryMinScore(0);
+                        setHistorySponsorship("All");
+                        setHistoryStatus("All");
+                        setHistoryDecision("All");
+                        setHistoryPage(1);
+                      }}
+                      className="text-[#D4AF37] text-[10px] uppercase tracking-widest mt-4 hover:underline"
+                    >
+                      Clear all filters
+                    </button>
+                  </div>
+                )}
+                {filteredHistory.length > 0 && totalPages > 1 && (
+                  <div className="p-4 border-t border-white/10 flex justify-between items-center bg-[#0A0A0A]">
+                    <span className="text-xs text-white/40">
+                      Showing {(historyPage - 1) * ITEMS_PER_PAGE + 1} to {Math.min(historyPage * ITEMS_PER_PAGE, filteredHistory.length)} of {filteredHistory.length}
+                    </span>
+                    <div className="flex gap-2">
+                       <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={historyPage === 1}
+                          onClick={() => setHistoryPage((p) => Math.max(1, p - 1))}
+                          className="h-8 text-xs bg-transparent border-white/10 text-white/70 hover:bg-white/5"
+                       >
+                         Previous
+                       </Button>
+                       <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={historyPage === totalPages}
+                          onClick={() => setHistoryPage((p) => Math.min(totalPages, p + 1))}
+                          className="h-8 text-xs bg-transparent border-white/10 text-white/70 hover:bg-white/5"
+                       >
+                         Next
+                       </Button>
+                    </div>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="flex flex-col items-center justify-center p-20 border border-dashed border-white/5 rounded-sm bg-white/[0.01]">
@@ -1880,37 +2514,24 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
 
               <div className="space-y-6">
                 <div className="space-y-2">
-                  <Label className="text-white/80">Gemini API Key</Label>
-                  <p className="text-[10px] text-white/40 uppercase tracking-widest">
-                    Overrides the environment variable key
-                  </p>
-                  <Input 
-                    type="password"
-                    placeholder="AIzaSy..."
-                    value={tempApiKey}
-                    onChange={(e) => setTempApiKey(e.target.value)}
-                    className="bg-[#0A0A0A] border-white/10 focus:border-[#D4AF37] focus:ring-[#D4AF37]/20 placeholder:text-white/20"
-                  />
-                  <p className="text-xs text-white/40 italic">
-                    Keys are stored securely in your browser's local storage.
-                  </p>
-                </div>
-
-                <div className="space-y-2">
                   <Label className="text-white/80">Primary Model</Label>
                   <p className="text-[10px] text-white/40 uppercase tracking-widest">
-                    The model used for generation
+                    Multi-provider fallback — if primary fails, next model is tried automatically
                   </p>
                   <select
                     value={tempModel}
-                    onChange={(e) => setTempModel(e.target.value)}
+                    onChange={(e) => setTempModel(Number(e.target.value))}
                     className="flex h-10 w-full rounded-md border border-white/10 bg-[#0A0A0A] px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-[#D4AF37]/50 focus:border-[#D4AF37]"
                   >
-                    <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview (Recommended)</option>
-                    <option value="gemini-3.1-flash-preview">gemini-3.1-flash-preview (Fast)</option>
-                    <option value="gemini-pro-latest">gemini-pro-latest</option>
-                    <option value="gemini-flash-latest">gemini-flash-latest</option>
+                    {MODEL_OPTIONS.map((m, i) => (
+                      <option key={i} value={i}>
+                        {m.name}{m.tag ? ` (${m.tag})` : ""}
+                      </option>
+                    ))}
                   </select>
+                  <p className="text-xs text-white/40 italic">
+                    API keys are managed server-side for security.
+                  </p>
                 </div>
               </div>
             </div>
@@ -1919,7 +2540,6 @@ ${resumeText ? resumeText.substring(0, 1500) : "Review based on above strengths/
               <Button 
                 variant="outline" 
                 onClick={() => {
-                  setTempApiKey(customApiKey);
                   setTempModel(selectedModel);
                   setIsSettingsOpen(false);
                 }}
